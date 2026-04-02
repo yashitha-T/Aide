@@ -536,7 +536,12 @@ def create_advanced_chart(df_1m: pd.DataFrame):
     fig.update_yaxes(showticklabels=False, secondary_y=False, showgrid=False)
     fig.update_yaxes(side="right", secondary_y=True, showgrid=True, gridcolor="#161b22")
 
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"displayModeBar": False},
+        key="markettrap_main_price_volume_chart",
+    )
 
 
 def render_risk_gauge(risk_score: float):
@@ -569,7 +574,12 @@ def render_risk_gauge(risk_score: float):
         margin=dict(l=30, r=30, t=50, b=20),
     )
 
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"displayModeBar": False},
+        key="markettrap_main_risk_gauge",
+    )
 
 
 @st.cache_data(ttl=2, show_spinner=False)
@@ -853,21 +863,25 @@ if data_mode != "simulated" and crossed_above_70 and curr_data is not None:
 col_chart, col_risk = st.columns([0.7, 0.3])
 
 with col_chart:
-    st.markdown(
-        """
-    <div style="background: var(--panel-bg); border: 1px solid var(--border-color); border-radius: 8px; padding: 1rem;">
-        <div style="color: var(--text-secondary); font-size: 0.75rem; margin-bottom: 1rem; font-family: 'JetBrains Mono'">REAL-TIME TAPE</div>
-    """,
-        unsafe_allow_html=True,
-    )
-    create_advanced_chart(merged_1m)
-    st.markdown("</div>", unsafe_allow_html=True)
+    chart_slot = st.empty()
+    with chart_slot.container():
+        st.markdown(
+            """
+        <div style="background: var(--panel-bg); border: 1px solid var(--border-color); border-radius: 8px; padding: 1rem;">
+            <div style="color: var(--text-secondary); font-size: 0.75rem; margin-bottom: 1rem; font-family: 'JetBrains Mono'">REAL-TIME TAPE</div>
+        """,
+            unsafe_allow_html=True,
+        )
+        create_advanced_chart(merged_1m)
+        st.markdown("</div>", unsafe_allow_html=True)
 
 with col_risk:
     risk_score = smoothed_risk
 
-    st.markdown('<div class="risk-gauge-container">', unsafe_allow_html=True)
-    render_risk_gauge(risk_score)
+    risk_slot = st.empty()
+    with risk_slot.container():
+        st.markdown('<div class="risk-gauge-container">', unsafe_allow_html=True)
+        render_risk_gauge(risk_score)
 
     risk_level = "LOW"
     risk_color = "var(--bullish)"
@@ -878,27 +892,27 @@ with col_risk:
         risk_level = "ELEVATED"
         risk_color = "var(--warning)"
 
-    st.markdown(
-        f"""
-        <div style="text-align: center; margin-top: 1rem; width:100%;">
-            <div style="color: var(--text-secondary); font-size: 0.8rem;">STATUS</div>
-            <div style="font-size: 1.5rem; font-weight: 700; color: {risk_color}; letter-spacing: 2px;">{risk_level}</div>
-            <div style="font-size: 0.68rem; color: var(--text-secondary); margin-top: 8px;">
-                STREAK ABOVE 70%: {streak_count}/{CRITICAL_STREAK_UPDATES}
+        st.markdown(
+            f"""
+            <div style="text-align: center; margin-top: 1rem; width:100%;">
+                <div style="color: var(--text-secondary); font-size: 0.8rem;">STATUS</div>
+                <div style="font-size: 1.5rem; font-weight: 700; color: {risk_color}; letter-spacing: 2px;">{risk_level}</div>
+                <div style="font-size: 0.68rem; color: var(--text-secondary); margin-top: 8px;">
+                    STREAK ABOVE 70%: {streak_count}/{CRITICAL_STREAK_UPDATES}
+                </div>
+                <div class="trap-type-badge">TRAP TYPE: {snapshot['trap_type']}</div>
+                <div style="margin-top: 8px; font-size: 0.62rem; color: var(--text-secondary);">DATA MODE: {data_mode.upper()}</div>
+                <div style="margin-top: 10px; font-size: 0.6rem; color: var(--text-secondary);">SENTIMENT: {"🐂 BULLISH" if snapshot['control'] == "Buyers in Control" else "🐻 BEARISH" if snapshot['control'] == "Sellers in Control" else "⚖️ NEUTRAL"}</div>
             </div>
-            <div class="trap-type-badge">TRAP TYPE: {snapshot['trap_type']}</div>
-            <div style="margin-top: 8px; font-size: 0.62rem; color: var(--text-secondary);">DATA MODE: {data_mode.upper()}</div>
-            <div style="margin-top: 10px; font-size: 0.6rem; color: var(--text-secondary);">SENTIMENT: {"🐂 BULLISH" if snapshot['control'] == "Buyers in Control" else "🐻 BEARISH" if snapshot['control'] == "Sellers in Control" else "⚖️ NEUTRAL"}</div>
-        </div>
-    """,
-        unsafe_allow_html=True,
-    )
+        """,
+            unsafe_allow_html=True,
+        )
 
-    render_control_indicator(snapshot["buyer_seller_control"])
-    reasons_to_show = snapshot["reasons"] if risk_score >= 40 else []
-    render_reasons_panel(reasons_to_show, risk_score)
-    render_component_attribution(snapshot.get("components", {}))
-    st.markdown("</div>", unsafe_allow_html=True)
+        render_control_indicator(snapshot["buyer_seller_control"])
+        reasons_to_show = snapshot["reasons"] if risk_score >= 40 else []
+        render_reasons_panel(reasons_to_show, risk_score)
+        render_component_attribution(snapshot.get("components", {}))
+        st.markdown("</div>", unsafe_allow_html=True)
 
 col_log, col_depth = st.columns([0.7, 0.3])
 with col_log:
