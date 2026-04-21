@@ -18,11 +18,18 @@ from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
+
 # Add project root to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from data_ingestion.binance_ws import BinanceWSClient
+from data_ingestion.binance_futures import BinanceFuturesClient
 from risk_inference.engine import MarketTrapEngine
+from risk_inference.realtime_trap_engine import compute_directional_bias_from_components
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +199,19 @@ st.markdown(
         border-radius: 10px;
         padding: 0.7rem;
     }
+    .decision-panel {
+        width: 100%;
+        margin-top: 0.7rem;
+        background: #0b1117;
+        border: 1px solid var(--border-color);
+        border-radius: 10px;
+        padding: 0.7rem;
+        text-align: center;
+        font-family: 'JetBrains Mono', monospace;
+    }
+    .row-block {
+        min-height: 390px;
+    }
 
     @keyframes pulse {
         0% { opacity: 1; }
@@ -225,6 +245,14 @@ if "binance_client" not in st.session_state:
 if "engine" not in st.session_state:
     st.session_state.engine = MarketTrapEngine()
 
+# Binance Futures client for OI, funding rate, long/short ratio
+if "futures_client" not in st.session_state:
+    st.session_state.futures_client = BinanceFuturesClient(
+        symbols=["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"],
+        poll_interval=30.0,
+    )
+    st.session_state.futures_client.start()
+
 if "terminal_events" not in st.session_state:
     st.session_state.terminal_events = deque(maxlen=30)
     # Add initial startup message
@@ -246,8 +274,13 @@ if "sim_mode_announced" not in st.session_state:
 if "last_risk_log_level" not in st.session_state:
     st.session_state.last_risk_log_level = None
 
+if "last_phase" not in st.session_state:
+    st.session_state.last_phase = "NEUTRAL"
+
 client = st.session_state.binance_client
 engine = st.session_state.engine
+# Wire futures client into engine so it can pull derivatives data
+engine.futures_client = st.session_state.futures_client
 
 def log_event(message: str, type: str = "info"):
     timestamp = datetime.utcnow().strftime("%H:%M:%S")
@@ -286,6 +319,13 @@ def render_header(is_critical: bool = False):
     """,
         unsafe_allow_html=True,
     )
+
+
+def format_trap_type_label(trap_type: str) -> str:
+    """UI label normalization without changing backend classification logic."""
+    if trap_type == "Anomaly-Driven Trap":
+        return "Potential Trap"
+    return trap_type
 
 
 def render_metrics(symbol: str, context_df: Optional[pd.DataFrame] = None):
@@ -680,14 +720,22 @@ def update_risk_state(symbol: str, raw_risk_score: float):
 
 def render_reasons_panel(reasons, risk_score):
     st.markdown('<div class="reasons-panel"><div style="font-size:0.72rem;color:var(--text-secondary);margin-bottom:0.45rem;">TOP TRAP REASONS</div>', unsafe_allow_html=True)
-    
+
     if reasons and risk_score >= 40:
-        for reason in reasons:
-            conf_color = "var(--text-secondary)"
-            if reason['confidence'] > 50: conf_color = "white"
-            st.markdown(f"<div style='font-size:0.78rem; margin-bottom:0.28rem;'>• {reason['reason']} <span style='color:{conf_color}'>({reason['confidence']:.1f}%)</span></div>", unsafe_allow_html=True)
+        ranked = sorted(reasons, key=lambda x: float(x.get("confidence", 0.0)), reverse=True)[:5]
+        for reason in ranked:
+            conf = float(reason.get("confidence", 0.0))
+            st.markdown(
+                f"""
+                <div style="font-size:0.76rem; display:flex; justify-content:space-between; margin-bottom:0.25rem;">
+                    <span>{reason.get("reason", "N/A")}</span>
+                    <span style="color:var(--text-secondary)">{conf:.1f}%</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
     else:
-        st.markdown("<div style='font-size:0.78rem;color:var(--text-secondary);'>Awaiting elevated trap conditions...</div>", unsafe_allow_html=True)
+        st.markdown("<div style='font-size:0.78rem;color:var(--text-secondary);'>No strong trap signals detected yet</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -710,12 +758,15 @@ def render_control_indicator(control_state: str):
 
 def render_component_attribution(components: dict):
     labels = [
-        ("Structure", components.get("structure_failure", 0.0)),
-        ("Volume", components.get("volume_behavior", 0.0)),
-        ("Momentum", components.get("momentum_exhaustion", 0.0)),
-        ("Anomaly", components.get("anomaly", 0.0)),
+        ("Structure", components.get("structure_failure", 0.0), "#58a6ff"),
+        ("Volume", components.get("volume_behavior", 0.0), "#58a6ff"),
+        ("Momentum", components.get("momentum_exhaustion", 0.0), "#58a6ff"),
+        ("Anomaly", components.get("anomaly", 0.0), "#8b5cf6"),
+        ("Liquidity", components.get("liquidity_intelligence", 0.0), "#f59e0b"),
+        ("Retail", components.get("retail_behavior", 0.0), "#ef4444"),
     ]
-    total = sum(max(0.0, val) for _, val in labels)
+    labels = sorted(labels, key=lambda x: float(x[1]), reverse=True)[:5]
+    total = sum(max(0.0, val) for _, val, _ in labels)
     if total <= 0:
         total = 1.0
 
@@ -723,7 +774,7 @@ def render_component_attribution(components: dict):
         '<div class="attribution-panel"><div style="font-size:0.70rem;color:var(--text-secondary);margin-bottom:0.45rem;">TRAP DNA (COMPONENT WEIGHT SHARE)</div>',
         unsafe_allow_html=True,
     )
-    for label, value in labels:
+    for label, value, color in labels:
         share = (max(0.0, value) / total) * 100.0
         st.markdown(
             f"""
@@ -731,12 +782,215 @@ def render_component_attribution(components: dict):
                 <span>{label}</span><span style="color:var(--text-secondary)">{share:.1f}%</span>
             </div>
             <div style="height:5px; border-radius:6px; background:#1f2937; margin-bottom:0.42rem;">
-                <div style="height:5px; border-radius:6px; width:{share:.1f}%; background:#58a6ff;"></div>
+                <div style="height:5px; border-radius:6px; width:{share:.1f}%; background:{color};"></div>
             </div>
             """,
             unsafe_allow_html=True,
         )
     st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _strength_label(value: float) -> str:
+    value = float(np.clip(value, 0.0, 1.0))
+    if value >= 0.66:
+        return "HIGH"
+    if value >= 0.33:
+        return "MEDIUM"
+    return "LOW"
+
+
+def render_trade_bias_panel(trap_type: str, risk_score: float, trap_direction: Optional[str] = None, reasons: list = None, components: dict = None):
+    trap_type_upper = (trap_type or "").upper()
+    trap_direction = (trap_direction or "").upper()
+    reasons = reasons or []
+    components = components or {}
+
+    # Step 1: Try to derive bias from dominant signal component
+    derived_bias, component_confidence = compute_directional_bias_from_components(components, risk_score)
+
+    # Step 2: If trap_direction is strong (from phase engine), prefer it; otherwise use derived bias
+    if trap_direction == "BULL_TRAP" or "BULL TRAP" in trap_type_upper:
+        bias = "SHORT"
+        bias_source = "phase"
+    elif trap_direction == "BEAR_TRAP" or "BEAR TRAP" in trap_type_upper:
+        bias = "LONG"
+        bias_source = "phase"
+    else:
+        # Use derived bias from components
+        bias = derived_bias
+        bias_source = "components"
+
+    # Step 3: Determine confidence level
+    if risk_score >= 60:
+        confidence = "HIGH"
+        subtext = "High probability setup"
+    elif risk_score >= 40:
+        confidence = "MEDIUM"
+        subtext = "Moderate setup"
+    else:
+        # Even at LOW risk_score, if components show clear dominance, we can indicate bias
+        confidence = component_confidence if bias_source == "components" else "LOW"
+        if confidence == "LOW":
+            subtext = "Weak signals present"
+        else:
+            subtext = "Setup forming"
+
+    # Step 4: Format display
+    if bias == "NEUTRAL":
+        display = "[ NEUTRAL ]"
+        if confidence == "LOW":
+            subtext = "No clear signal dominance"
+    else:
+        if confidence == "LOW":
+            display = f"Weak Bias: {bias}"
+            subtext = "Signal emerging"
+        elif confidence == "MEDIUM":
+            display = f"Moderate Bias: {bias}"
+        else:
+            display = f"Strong Bias: {bias}"
+
+    # Step 5: Generate reasoning
+    reasons_html = ""
+    if reasons and (confidence == "LOW" or confidence == "MEDIUM"):
+        ranked = sorted(reasons, key=lambda x: float(x.get("confidence", 0.0)), reverse=True)[:2]
+        top_reasons = [r.get("reason", "") for r in ranked]
+        if top_reasons:
+            reasons_html = "<br/>".join([f"• {r}" for r in top_reasons])
+    
+    if not reasons_html and bias != "NEUTRAL":
+        # Generate generic reasoning based on dominant component
+        if components:
+            max_component = max(
+                (k, v) for k, v in components.items() if v > 0.1
+            ) if any(v > 0.1 for v in components.values()) else None
+            
+            if max_component:
+                component_name = max_component[0]
+                reason_map = {
+                    "volume_behavior": "High volume without price follow-through",
+                    "structure_failure": "Breakout rejection pattern detected",
+                    "momentum_exhaustion": "Momentum rapidly fading",
+                    "liquidity_intelligence": "Liquidation cluster identified",
+                    "retail_behavior": "Retail sentiment mismatch",
+                    "anomaly": "Unusual market behavior detected",
+                }
+                reasons_html = f"• {reason_map.get(component_name, 'Signal detected')}"
+    
+    if reasons_html:
+        reasons_html = f'<div style="font-size:0.65rem; color:var(--text-secondary); margin-top:0.45rem; text-align:left; line-height:1.3;">Reasoning:<br/>{reasons_html}</div>'
+
+    st.markdown(
+        f"""
+        <div class="decision-panel">
+            <div style="font-size:0.70rem; color:var(--text-secondary); margin-bottom:0.35rem;">TRADE BIAS</div>
+            <div style="font-size:1.00rem; font-weight:700; letter-spacing:0.8px;">{display}</div>
+            <div style="font-size:0.70rem; color:var(--text-secondary); margin-top:0.25rem;">{subtext}</div>
+            {reasons_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_liquidity_signals_panel(snapshot: dict, symbol: str):
+    diagnostics = snapshot.get("diagnostics", {}) or {}
+    components = snapshot.get("components", {}) or {}
+
+    stoploss_density = float(diagnostics.get("liquidity_stoploss_density", 0.0))
+    oi_divergence = float(diagnostics.get("liquidity_oi_divergence", 0.0))
+    liq_proximity = float(diagnostics.get("liquidity_proximity", 0.0))
+    liq_component = float(components.get("liquidity_intelligence", 0.0))
+
+    latest_funding = 0.0
+    latest_ls_ratio = 1.0
+    oi_change = 0.0
+    try:
+        funding_entry = st.session_state.futures_client.latest_funding(symbol.upper()) or {}
+        latest_funding = float(funding_entry.get("funding_rate", 0.0))
+    except Exception:
+        pass
+    try:
+        ls_entry = st.session_state.futures_client.latest_ls_ratio(symbol.upper()) or {}
+        latest_ls_ratio = float(ls_entry.get("long_short_ratio", 1.0))
+    except Exception:
+        pass
+    try:
+        oi_series = st.session_state.futures_client.get_oi_series(symbol.upper(), n=2)
+        if len(oi_series) == 2:
+            prev_oi = float(oi_series[0].get("open_interest", 0.0))
+            curr_oi = float(oi_series[1].get("open_interest", 0.0))
+            if prev_oi != 0:
+                oi_change = (curr_oi - prev_oi) / abs(prev_oi)
+    except Exception:
+        pass
+
+    st.markdown(
+        '<div class="attribution-panel"><div style="font-size:0.70rem;color:var(--text-secondary);margin-bottom:0.45rem;">LIQUIDITY SIGNALS</div>',
+        unsafe_allow_html=True,
+    )
+    metric_cols = st.columns(3)
+    metric_cols[0].metric("Funding", f"{latest_funding:.4f}", help="Perpetual futures funding rate.")
+    metric_cols[1].metric("OI Change", f"{oi_change*100:.2f}%", help="Latest open-interest change.")
+    metric_cols[2].metric("L/S Ratio", f"{latest_ls_ratio:.2f}", help="Global long/short account ratio.")
+
+    st.metric("Liquidity", f"{liq_component*100:.1f}%", help="Aggregated liquidity trap pressure score.")
+    st.progress(float(np.clip(liq_component, 0.0, 1.0)))
+    indicator_cols = st.columns(3)
+    indicator_cols[0].markdown(f"<div style='font-size:0.72rem;'>OI Div: <b>{_strength_label(abs(oi_divergence))}</b></div>", unsafe_allow_html=True)
+    indicator_cols[1].markdown(f"<div style='font-size:0.72rem;'>Liq Below: <b>{_strength_label(stoploss_density)}</b></div>", unsafe_allow_html=True)
+    indicator_cols[2].markdown(f"<div style='font-size:0.72rem;'>Liq Prox: <b>{liq_proximity:.2f}</b></div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_retail_behavior_panel(snapshot: dict):
+    diagnostics = snapshot.get("diagnostics", {}) or {}
+    components = snapshot.get("components", {}) or {}
+
+    fomo = float(diagnostics.get("retail_fomo_at_resistance", 0.0))
+    panic = float(diagnostics.get("retail_panic_at_support", 0.0))
+    crowd = float(diagnostics.get("retail_crowd_score", 0.0))
+    retail_component = float(components.get("retail_behavior", 0.0))
+
+    st.markdown(
+        '<div class="attribution-panel"><div style="font-size:0.70rem;color:var(--text-secondary);margin-bottom:0.45rem;">RETAIL BEHAVIOR</div>',
+        unsafe_allow_html=True,
+    )
+    st.metric("FOMO Index", f"{fomo:.2f}", help="Measures retail buying pressure near resistance.")
+    st.progress(float(np.clip(fomo, 0.0, 1.0)))
+    st.markdown(f"<div style='font-size:0.74rem;'>FOMO: <b>{_strength_label(fomo)}</b></div>", unsafe_allow_html=True)
+
+    st.metric("Panic Index", f"{panic:.2f}", help="Measures retail sell pressure near support.")
+    st.progress(float(np.clip(panic, 0.0, 1.0)))
+    st.markdown(f"<div style='font-size:0.74rem;'>Panic: <b>{_strength_label(panic)}</b></div>", unsafe_allow_html=True)
+
+    st.metric("Retail Score", f"{retail_component*100:.1f}%", help="Combined retail behavior signal.")
+    st.markdown(f"<div style='font-size:0.74rem;'>Crowd Positioning: <b>{_strength_label(abs(crowd))}</b></div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_phase_badge(phase: str, confidence: float, direction: Optional[str]):
+    """Render the trap phase state machine badge."""
+    phase_colors = {
+        "NEUTRAL": ("#8b949e", "rgba(139,148,158,0.10)"),
+        "ACCUMULATION": ("#58a6ff", "rgba(88,166,255,0.12)"),
+        "MANIPULATION": ("#f59e0b", "rgba(245,158,11,0.12)"),
+        "DISTRIBUTION": ("#ef4444", "rgba(239,68,68,0.12)"),
+        "REVERSAL": ("#dc2626", "rgba(220,38,38,0.15)"),
+    }
+    fg, bg = phase_colors.get(phase, phase_colors["NEUTRAL"])
+    conf_pct = round(confidence * 100)
+    subtext = "Stable Market Conditions" if phase == "NEUTRAL" else f"Confidence: {conf_pct}%"
+
+    st.markdown(
+        f"""
+        <div style="margin-top:0.8rem; padding:0.6rem; border-radius:10px; border:1px solid {fg};
+                    background:{bg}; text-align:center;">
+            <div style="font-size:1.1rem; font-weight:700; color:{fg}; font-family:'JetBrains Mono'; letter-spacing:1px;">{phase}</div>
+            <div style="font-size:0.70rem; color:var(--text-secondary); margin-top:0.25rem;">{subtext}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # Sidebar Settings
@@ -809,7 +1063,27 @@ else:
             merged_1m['datetime'] = pd.to_datetime(merged_1m['timestamp'], unit='s')
             data_mode = "historical"
 
-snapshot = engine.get_risk_snapshot(symbol_choice, merged_1m)
+if "snapshot_cache" not in st.session_state:
+    st.session_state.snapshot_cache = {}
+
+cache_symbol = symbol_choice.upper()
+latest_bar_ts = None
+if merged_1m is not None and not merged_1m.empty and "timestamp" in merged_1m.columns:
+    latest_bar_ts = int(merged_1m["timestamp"].iloc[-1])
+
+cached_entry = st.session_state.snapshot_cache.get(cache_symbol, {})
+cached_ts = cached_entry.get("latest_bar_ts")
+
+if latest_bar_ts is not None and cached_ts == latest_bar_ts and cached_entry.get("snapshot") is not None:
+    # Reuse previous inference until a new 1m candle arrives.
+    snapshot = cached_entry["snapshot"]
+else:
+    snapshot = engine.get_risk_snapshot(symbol_choice, merged_1m)
+    st.session_state.snapshot_cache[cache_symbol] = {
+        "latest_bar_ts": latest_bar_ts,
+        "snapshot": snapshot,
+    }
+
 snapshot["main_reason"] = snapshot["reasons"][0]["reason"] if snapshot["reasons"] else "Monitoring..."
 snapshot["buyer_seller_control"] = snapshot["control"]
 
@@ -842,10 +1116,24 @@ else:
         log_event(f"INITIAL BIAS: {snapshot['control'].upper()}", "info")
         st.session_state.last_control = snapshot["control"]
 
+    # Log phase transitions
+    current_phase = snapshot.get("phase", "NEUTRAL")
+    if current_phase != st.session_state.last_phase:
+        phase_dir = snapshot.get('trap_direction', '')
+        dir_str = f" ({phase_dir})" if phase_dir else ""
+        if current_phase in ("MANIPULATION", "DISTRIBUTION", "REVERSAL"):
+            log_event(f"PHASE: {st.session_state.last_phase} → {current_phase}{dir_str}", "error")
+        elif current_phase == "ACCUMULATION":
+            log_event(f"PHASE: {st.session_state.last_phase} → {current_phase}", "warning")
+        else:
+            log_event(f"PHASE: {st.session_state.last_phase} → {current_phase}", "info")
+        st.session_state.last_phase = current_phase
+
     st.session_state.last_risk_log_level = risk_level_for_log
 
 render_header(is_critical=is_critical)
 
+# --- Row 1: Full-width metrics ---
 curr_data = render_metrics(symbol_choice, merged_1m)
 
 if data_mode != "simulated" and crossed_above_70 and curr_data is not None:
@@ -860,76 +1148,133 @@ if data_mode != "simulated" and crossed_above_70 and curr_data is not None:
         }
     )
 
-col_chart, col_risk = st.columns([0.7, 0.3])
-
-with col_chart:
-    chart_slot = st.empty()
-    with chart_slot.container():
-        st.markdown(
-            """
-        <div style="background: var(--panel-bg); border: 1px solid var(--border-color); border-radius: 8px; padding: 1rem;">
-            <div style="color: var(--text-secondary); font-size: 0.75rem; margin-bottom: 1rem; font-family: 'JetBrains Mono'">REAL-TIME TAPE</div>
-        """,
-            unsafe_allow_html=True,
-        )
-        create_advanced_chart(merged_1m)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-with col_risk:
-    risk_score = smoothed_risk
-
-    risk_slot = st.empty()
-    with risk_slot.container():
-        st.markdown('<div class="risk-gauge-container">', unsafe_allow_html=True)
-        render_risk_gauge(risk_score)
-
-    risk_level = "LOW"
-    risk_color = "var(--bullish)"
-    if is_critical:
-        risk_level = "CRITICAL"
-        risk_color = "var(--bearish)"
-    elif risk_score > 30:
-        risk_level = "ELEVATED"
-        risk_color = "var(--warning)"
-
-        st.markdown(
-            f"""
-            <div style="text-align: center; margin-top: 1rem; width:100%;">
-                <div style="color: var(--text-secondary); font-size: 0.8rem;">STATUS</div>
-                <div style="font-size: 1.5rem; font-weight: 700; color: {risk_color}; letter-spacing: 2px;">{risk_level}</div>
-                <div style="font-size: 0.68rem; color: var(--text-secondary); margin-top: 8px;">
-                    STREAK ABOVE 70%: {streak_count}/{CRITICAL_STREAK_UPDATES}
-                </div>
-                <div class="trap-type-badge">TRAP TYPE: {snapshot['trap_type']}</div>
-                <div style="margin-top: 8px; font-size: 0.62rem; color: var(--text-secondary);">DATA MODE: {data_mode.upper()}</div>
-                <div style="margin-top: 10px; font-size: 0.6rem; color: var(--text-secondary);">SENTIMENT: {"🐂 BULLISH" if snapshot['control'] == "Buyers in Control" else "🐻 BEARISH" if snapshot['control'] == "Sellers in Control" else "⚖️ NEUTRAL"}</div>
-            </div>
-        """,
-            unsafe_allow_html=True,
-        )
-
-        render_control_indicator(snapshot["buyer_seller_control"])
-        reasons_to_show = snapshot["reasons"] if risk_score >= 40 else []
-        render_reasons_panel(reasons_to_show, risk_score)
-        render_component_attribution(snapshot.get("components", {}))
-        st.markdown("</div>", unsafe_allow_html=True)
-
-col_log, col_depth = st.columns([0.7, 0.3])
-with col_log:
-    render_terminal_log()
-with col_depth:
-    if curr_data is not None:
-        render_order_book(symbol_choice, curr_data["price"])
+risk_score = smoothed_risk
+# If score is low, still show a trap_type when component signals are meaningful
+if risk_score < 30:
+    comps = snapshot.get("components", {}) or {}
+    # If any component shows meaningful strength, display the trap type anyway
+    if any((float(v) if v is not None else 0.0) > 0.25 for v in comps.values()):
+        display_trap_type = format_trap_type_label(snapshot.get("trap_type", ""))
     else:
-        st.info("Awaiting price for depth...")
+        display_trap_type = "No confirmed trap pattern"
+else:
+    display_trap_type = format_trap_type_label(snapshot.get("trap_type", ""))
+risk_level = "LOW"
+risk_color = "var(--bullish)"
+if is_critical:
+    risk_level = "CRITICAL"
+    risk_color = "var(--bearish)"
+elif risk_score > 30:
+    risk_level = "ELEVATED"
+    risk_color = "var(--warning)"
 
-st.markdown("### TRAP HISTORY (LAST 10)")
+# --- Row 2: 60 / 40 ---
+row2_left, row2_right = st.columns([3, 2])
+with row2_left:
+    st.subheader("Price Action")
+    st.markdown(
+        '<div style="color: var(--text-secondary); font-size: 0.75rem; margin-bottom: 0.5rem; font-family: \'JetBrains Mono\'">REAL-TIME TAPE</div>',
+        unsafe_allow_html=True,
+    )
+    create_advanced_chart(merged_1m)
+
+with row2_right:
+    st.subheader("Risk View")
+    st.markdown('<div style="height:0.2rem"></div>', unsafe_allow_html=True)
+    render_risk_gauge(risk_score)
+    
+    if risk_score < 30:
+        zone_label = "Low Risk Zone"
+        zone_color = "var(--bullish)"
+    elif risk_score < 60:
+        zone_label = "Watch Zone"
+        zone_color = "var(--warning)"
+    else:
+        zone_label = "Trap Zone"
+        zone_color = "var(--bearish)"
+        
+    st.markdown(
+        f"<div style='text-align:center; font-size:0.85rem; font-weight:bold; color:{zone_color}; margin-top:-15px; margin-bottom:15px;'>{zone_label}</div>",
+        unsafe_allow_html=True
+    )
+
+    render_trade_bias_panel(
+        trap_type=snapshot.get("trap_type", ""),
+        risk_score=risk_score,
+        trap_direction=snapshot.get("trap_direction"),
+        reasons=snapshot.get("reasons", []),
+        components=snapshot.get("components", {})
+    )
+    st.markdown(
+        f"""
+        <div style="text-align: center; margin-top: 1rem; width:100%;">
+            <div style="color: var(--text-secondary); font-size: 0.8rem;">RISK LEVEL</div>
+            <div style="font-size: 1.5rem; font-weight: 700; color: {risk_color}; letter-spacing: 2px;">{risk_level}</div>
+            <div style="font-size: 0.68rem; color: var(--text-secondary); margin-top: 8px;">
+                STREAK ABOVE 70%: {streak_count}/{CRITICAL_STREAK_UPDATES}
+            </div>
+            <div class="trap-type-badge">TRAP TYPE: {display_trap_type}</div>
+            <div style="margin-top: 8px; font-size: 0.62rem; color: var(--text-secondary);">DATA MODE: {data_mode.upper()}</div>
+            <div style="margin-top: 10px; font-size: 0.6rem; color: var(--text-secondary);">SENTIMENT: {"🐂 BULLISH" if snapshot['control'] == "Buyers in Control" else "🐻 BEARISH" if snapshot['control'] == "Sellers in Control" else "⚖️ NEUTRAL"}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    render_control_indicator(snapshot["buyer_seller_control"])
+
+st.markdown("---")
+
+# --- Row 3: 50 / 50 ---
+row3_left, row3_right = st.columns(2)
+with row3_left:
+    st.subheader("Phase & System")
+    with st.container():
+        render_phase_badge(
+            phase=snapshot.get("phase", "NEUTRAL"),
+            confidence=snapshot.get("phase_confidence", 0.0),
+            direction=snapshot.get("trap_direction"),
+        )
+        render_terminal_log()
+
+with row3_right:
+    st.subheader("Signal Drivers")
+    with st.container():
+        render_component_attribution(snapshot.get("components", {}))
+        reasons_to_show = snapshot["reasons"] if snapshot.get("reasons") else []
+        render_reasons_panel(reasons_to_show, risk_score)
+
+st.markdown("---")
+
+# --- Row 4: 50 / 50 ---
+row4_left, row4_right = st.columns(2)
+with row4_left:
+    st.subheader("Liquidity Intelligence")
+    with st.container():
+        render_liquidity_signals_panel(snapshot, symbol_choice)
+
+with row4_right:
+    st.subheader("Retail Behavior")
+    with st.container():
+        render_retail_behavior_panel(snapshot)
+
+# Optional depth panel retained without altering overall layout balance.
+if curr_data is not None:
+    st.markdown("---")
+    st.subheader("Order Depth")
+    render_order_book(symbol_choice, curr_data["price"])
+
+st.markdown("---")
+st.subheader("Trap History")
 if st.session_state.trap_history:
     history_df = pd.DataFrame(list(st.session_state.trap_history))
-    st.dataframe(history_df, use_container_width=True, hide_index=True)
+    st.dataframe(history_df, use_container_width=True, hide_index=True, height=220)
 else:
-    st.info("No trap events have crossed above 70% yet.")
+    st.info("No high-confidence traps detected yet")
 
-# Real-time update loop
-time.sleep(refresh_rate)
-st.rerun()
+# Real-time refresh loop.
+# Prefer st_autorefresh to avoid render stacking artifacts from manual sleep/rerun loops.
+if st_autorefresh is not None:
+    st_autorefresh(interval=refresh_rate * 1000, key="markettrap_live_refresh")
+else:
+    time.sleep(refresh_rate)
+    st.rerun()

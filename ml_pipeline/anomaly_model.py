@@ -50,9 +50,17 @@ class IsolationForestModel:
         self.feature_columns = None
         self.is_fitted = False
         
-    def _prepare_features(self, df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
+    def _prepare_features(
+        self,
+        df: pd.DataFrame,
+        dynamic_feature_columns: Optional[List[str]] = None
+    ) -> Tuple[np.ndarray, List[str]]:
         """
         Prepare features for model input.
+        
+        Dynamically aligns input features to the columns the model was
+        trained on.  If the model has not been fitted yet, all numeric
+        columns are used (first-fit captures the column set).
         
         Args:
             df: Input DataFrame with OHLCV and derived features
@@ -62,9 +70,12 @@ class IsolationForestModel:
         """
         # Select only numeric columns and drop any remaining NaNs
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if dynamic_feature_columns:
+            numeric_cols = [c for c in dynamic_feature_columns if c in numeric_cols]
         features = df[numeric_cols].dropna(axis=1)
 
         if self.feature_columns is None:
+            # First fit — capture whatever columns are available
             self.feature_columns = features.columns.tolist()
         else:
             # Align features to the saved training columns
@@ -75,13 +86,6 @@ class IsolationForestModel:
             if extra:
                 features = features.drop(columns=extra)
             features = features[self.feature_columns]
-        # Enforce the 6 features the scaler expects
-        required_6 = ['price_return', 'volume_change', 'volatility', 'breakout_strength', 'is_breakout', 'pv_divergence']
-        for col in required_6:
-            if col not in features.columns:
-                features[col] = 0
-        features = features[required_6]
-        self.feature_columns = required_6
 
         return features.values, self.feature_columns
     
@@ -108,7 +112,11 @@ class IsolationForestModel:
         
         return self
     
-    def predict_anomaly_scores(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
+    def predict_anomaly_scores(
+        self,
+        X: Union[pd.DataFrame, np.ndarray],
+        dynamic_feature_columns: Optional[List[str]] = None
+    ) -> np.ndarray:
         """
         Predict anomaly scores for the input data.
         
@@ -122,14 +130,18 @@ class IsolationForestModel:
             raise RuntimeError("Model must be fitted before prediction")
             
         if isinstance(X, pd.DataFrame):
-            X, _ = self._prepare_features(X)
+            X, _ = self._prepare_features(X, dynamic_feature_columns=dynamic_feature_columns)
             
         X_scaled = self.scaler.transform(X)
         return -self.model.score_samples(X_scaled)  # Convert to positive (higher = more anomalous)
 
-    def anomaly_score(self, X: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
+    def anomaly_score(
+        self,
+        X: Union[pd.DataFrame, np.ndarray],
+        dynamic_feature_columns: Optional[List[str]] = None
+    ) -> np.ndarray:
         """Backward-compatible alias for predict_anomaly_scores."""
-        return self.predict_anomaly_scores(X)
+        return self.predict_anomaly_scores(X, dynamic_feature_columns=dynamic_feature_columns)
     
     def compute_risk_percentage(
         self,
@@ -183,7 +195,8 @@ class IsolationForestModel:
     def predict_latest_risk(
         self,
         df: pd.DataFrame,
-        symbol: str = "default"
+        symbol: str = "default",
+        dynamic_feature_columns: Optional[List[str]] = None
     ) -> Dict[str, float]:
         """
         Convenience method to get the risk score and percentage for the latest data point.
@@ -199,13 +212,39 @@ class IsolationForestModel:
             return {"anomaly_score": 0.0, "risk_percentage": 0.0}
             
         # Get anomaly scores for the whole batch to keep window consistent
-        anomaly_scores = self.predict_anomaly_scores(df)
+        anomaly_scores = self.predict_anomaly_scores(df, dynamic_feature_columns=dynamic_feature_columns)
         risk_percentages = self.compute_risk_percentage(anomaly_scores, symbol)
         
         return {
             'anomaly_score': float(anomaly_scores[-1]),
             'risk_percentage': float(risk_percentages[-1])
         }
+
+    def predict_as_feature(
+        self,
+        df: pd.DataFrame,
+        symbol: str = "default",
+        dynamic_feature_columns: Optional[List[str]] = None
+    ) -> float:
+        """
+        Return anomaly as a stable normalized feature in [0, 1].
+
+        Uses the same rolling normalization path as risk_percentage for
+        consistency across assets and runtime sessions.
+        """
+        if not self.is_fitted:
+            return 0.0
+
+        try:
+            latest = self.predict_latest_risk(
+                df=df,
+                symbol=symbol,
+                dynamic_feature_columns=dynamic_feature_columns,
+            )
+            return float(np.clip(latest.get("risk_percentage", 0.0) / 100.0, 0.0, 1.0))
+        except Exception as exc:
+            logger.debug("predict_as_feature failed: %s", exc)
+            return 0.0
     
     def save(self, filepath: str) -> None:
         """

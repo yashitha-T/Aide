@@ -9,9 +9,11 @@ import threading
 import logging
 from collections import deque
 from typing import Dict, List, Optional, Deque
-import websocket
+
 import pandas as pd
 import requests
+import websocket
+
 try:
     import yfinance as yf
 except ImportError:
@@ -19,9 +21,10 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
 class BinanceWSClient:
     """Robust Binance WebSocket client for streaming market data."""
-    
+
     def __init__(self, symbols: List[str] = None):
         self.symbols = [s.lower() for s in (symbols or ["btcusdt"])]
         self.base_url = "wss://stream.binance.com:9443"
@@ -31,7 +34,6 @@ class BinanceWSClient:
         self.ws: Optional[websocket.WebSocketApp] = None
         self.is_running = False
         self.reconnect_delay = 5
-        # Flag set when Binance rejects connections (e.g. HTTP 451 geographic restriction)
         self.restricted = False
         self.last_error = None
         self.fallback_active = False
@@ -40,81 +42,97 @@ class BinanceWSClient:
     def _on_message(self, ws, message):
         try:
             data = json.loads(message)
-            
-            # Handle Ticker data (24hr ticker or Mini-Ticker)
-            # We'll use individual symbol streams for simplicity
             stream_name = data.get("stream", "")
             msg_data = data.get("data", {})
-            
+
+            symbol = msg_data.get("s", "").lower()
+            if symbol not in self.symbols:
+                return
+
+            if "@kline_1m" in stream_name:
+                kline = msg_data.get("k", {})
+                taker_buy_base_asset_volume = float(kline.get("V", 0.0))
+                total_volume = float(kline.get("v", 0.0))
+                taker_sell_volume = max(0.0, total_volume - taker_buy_base_asset_volume)
+
+                tick = {
+                    "timestamp": float(msg_data.get("E", time.time() * 1000)) / 1000.0,
+                    "price": float(kline.get("c", 0.0)),
+                    "high": float(kline.get("h", 0.0)),
+                    "low": float(kline.get("l", 0.0)),
+                    "volume": total_volume,
+                    "quote_volume": float(kline.get("q", 0.0)),
+                    "taker_buy_base_asset_volume": taker_buy_base_asset_volume,
+                    "total_volume": total_volume,
+                    "taker_buy_volume": taker_buy_base_asset_volume,
+                    "taker_sell_volume": taker_sell_volume,
+                    "symbol": symbol,
+                }
+                self.tick_buffers[symbol].append(tick)
+                self.last_price[symbol] = tick["price"]
+                self.last_update[symbol] = tick["timestamp"]
+                return
+
             if "@ticker" in stream_name:
-                symbol = msg_data.get("s", "").lower()
-                if symbol in self.symbols:
-                    tick = {
-                        "timestamp": msg_data["E"] / 1000,
-                        "price": float(msg_data["c"]),
-                        "high": float(msg_data["h"]),
-                        "low": float(msg_data["l"]),
-                        "volume": float(msg_data["v"]),
-                        "quote_volume": float(msg_data["q"]),
-                        "symbol": symbol
-                    }
-                    self.tick_buffers[symbol].append(tick)
-                    self.last_price[symbol] = tick["price"]
-                    self.last_update[symbol] = tick["timestamp"]
-            
-            elif "@trade" in stream_name:
-                symbol = msg_data.get("s", "").lower()
-                if symbol in self.symbols:
-                    # You could process individual trades here for higher resolution
-                    pass
-                    
+                total_volume = float(msg_data.get("v", 0.0))
+                taker_buy_base_asset_volume = float(msg_data.get("taker_buy_base_asset_volume", total_volume * 0.5))
+                taker_sell_volume = max(0.0, total_volume - taker_buy_base_asset_volume)
+
+                tick = {
+                    "timestamp": float(msg_data.get("E", time.time() * 1000)) / 1000.0,
+                    "price": float(msg_data.get("c", 0.0)),
+                    "high": float(msg_data.get("h", 0.0)),
+                    "low": float(msg_data.get("l", 0.0)),
+                    "volume": total_volume,
+                    "quote_volume": float(msg_data.get("q", 0.0)),
+                    "taker_buy_base_asset_volume": taker_buy_base_asset_volume,
+                    "total_volume": total_volume,
+                    "taker_buy_volume": taker_buy_base_asset_volume,
+                    "taker_sell_volume": taker_sell_volume,
+                    "symbol": symbol,
+                }
+                self.tick_buffers[symbol].append(tick)
+                self.last_price[symbol] = tick["price"]
+                self.last_update[symbol] = tick["timestamp"]
+
         except Exception as e:
-            logger.error(f"Error processing WS message: {e}")
+            logger.error("Error processing WS message: %s", e)
 
     def _on_error(self, ws, error):
         err_str = str(error)
-        logger.error(f"WebSocket error: {err_str}")
-        # Save last error for diagnostics
+        logger.error("WebSocket error: %s", err_str)
         self.last_error = err_str
 
-        # Detect Binance-restricted responses (HTTP 451 / eligibility messages)
         lower = err_str.lower()
-        if '451' in err_str or 'restricted location' in lower or 'eligibility' in lower:
+        if "451" in err_str or "restricted location" in lower or "eligibility" in lower:
             self.restricted = True
             logger.error("Connection rejected by Binance: restricted location (HTTP 451).")
-        else:
-            # keep previous restricted flag only if we continue to see errors; otherwise clear
-            # but prefer explicit detection above
-            self.restricted = getattr(self, 'restricted', False)
 
     def _on_close(self, ws, close_status_code, close_msg):
-        logger.warning(f"WebSocket closed: {close_status_code} - {close_msg}")
-        if getattr(self, 'restricted', False):
-            logger.error("WebSocket closed due to Binance restriction (HTTP 451). No retry will resolve this from this host.")
+        logger.warning("WebSocket closed: %s - %s", close_status_code, close_msg)
         if self.is_running:
-            logger.info(f"Attempting to reconnect in {self.reconnect_delay} seconds...")
+            logger.info("Attempting to reconnect in %s seconds...", self.reconnect_delay)
             time.sleep(self.reconnect_delay)
             self._connect()
 
     def _on_open(self, ws):
-        logger.info(f"WebSocket connected for symbols: {self.symbols}")
-        # Subscriptions happen via the URL in this implementation, 
-        # but could also be done via send() commands.
+        logger.info("WebSocket connected for symbols: %s", self.symbols)
 
     def _connect(self):
-        # Build stream path
-        # Example: btcbusd@ticker/ethbusd@ticker
-        streams = "/".join([f"{s}@ticker" for s in self.symbols])
-        url = f"{self.base_url}/stream?streams={streams}"
-        
+        streams = []
+        for s in self.symbols:
+            streams.append(f"{s}@ticker")
+            streams.append(f"{s}@kline_1m")
+        url = f"{self.base_url}/stream?streams={'/'.join(streams)}"
+
         self.ws = websocket.WebSocketApp(
             url,
             on_open=self._on_open,
             on_message=self._on_message,
             on_error=self._on_error,
-            on_close=self._on_close
+            on_close=self._on_close,
         )
-        
+
         self.ws.run_forever(ping_interval=20, ping_timeout=10)
 
     def start(self):
@@ -139,9 +157,7 @@ class BinanceWSClient:
         buffer = self.tick_buffers.get(symbol)
         if not buffer:
             return None
-        
-        # Lock not strictly needed due to GIL and deque thread-safety for append/pop
-        # but list(buffer) might have slight race conditions during heavy updates
+
         df = pd.DataFrame(list(buffer))
         if df.empty and self.restricted and not self.fallback_active:
             self._start_fallback()
@@ -151,53 +167,56 @@ class BinanceWSClient:
         """Start a background thread to fetch data from Yahoo Finance if Binance is blocked."""
         if self.fallback_active or not yf:
             return
-        
+
         self.fallback_active = True
         self._fallback_thread = threading.Thread(target=self._fallback_loop, daemon=True)
         self._fallback_thread.start()
         logger.info("Yahoo Finance Fallback thread started.")
 
     def _fallback_loop(self):
-        """Periodically fetch 'semi-live' data from yfinance for all symbols."""
+        """Periodically fetch semi-live data from yfinance for all symbols."""
         while self.is_running and self.fallback_active:
             try:
                 for symbol in self.symbols:
-                    # yfinance uses symbols like BTC-USD
                     yf_sym = symbol.upper()
                     if "USDT" in yf_sym:
                         yf_sym = yf_sym.replace("USDT", "-USD")
-                    
+
                     ticker = yf.Ticker(yf_sym)
-                    # Fetching 1m interval for last day
                     df = ticker.history(period="1d", interval="1m").tail(5)
                     if not df.empty:
                         for idx, row in df.iterrows():
+                            total_volume = float(row["Volume"])
+                            taker_buy_volume = total_volume * 0.5
                             tick = {
                                 "timestamp": idx.timestamp(),
                                 "price": float(row["Close"]),
                                 "high": float(row["High"]),
                                 "low": float(row["Low"]),
-                                "volume": float(row["Volume"]),
-                                "symbol": symbol.lower()
+                                "volume": total_volume,
+                                "taker_buy_base_asset_volume": taker_buy_volume,
+                                "total_volume": total_volume,
+                                "taker_buy_volume": taker_buy_volume,
+                                "taker_sell_volume": max(0.0, total_volume - taker_buy_volume),
+                                "symbol": symbol.lower(),
                             }
-                            # Check if timestamp is already in buffer to avoid duplicates
                             last_tick = self.tick_buffers[symbol.lower()][-1] if self.tick_buffers[symbol.lower()] else None
                             if not last_tick or tick["timestamp"] > last_tick["timestamp"]:
                                 self.tick_buffers[symbol.lower()].append(tick)
                                 self.last_price[symbol.lower()] = tick["price"]
                                 self.last_update[symbol.lower()] = tick["timestamp"]
-                
-                time.sleep(15) # Poll every 15s for "semi-live" feel
+
+                time.sleep(15)
             except Exception as e:
-                logger.error(f"Fallback fetch error: {e}")
+                logger.error("Fallback fetch error: %s", e)
                 time.sleep(30)
 
+
 if __name__ == "__main__":
-    # Test script
     logging.basicConfig(level=logging.INFO)
     client = BinanceWSClient(symbols=["btcusdt", "ethusdt"])
     client.start()
-    
+
     try:
         while True:
             time.sleep(5)

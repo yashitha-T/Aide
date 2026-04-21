@@ -31,6 +31,10 @@ class AssetParams:
     volume_reason: str
     momentum_reason: str
 
+    # Derivatives / liquidity parameters (defaults so existing entries work)
+    avg_leverage: float = 15.0       # Average retail leverage for liquidation estimation
+    oi_spike_threshold: float = 2.0  # Std-devs for OI spike detection
+
 
 ASSET_REGISTRY: Dict[str, AssetParams] = {
     "BTC-USD": AssetParams(

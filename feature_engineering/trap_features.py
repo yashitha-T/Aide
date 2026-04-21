@@ -60,9 +60,14 @@ def compute_trap_features(
     rolling_high = features["high"].rolling(window=breakout_window, min_periods=1).max()
     rolling_low = features["low"].rolling(window=breakout_window, min_periods=1).min()
 
-    features["breakout_strength"] = _safe_divide(
+    volume_ma_20 = features["volume"].rolling(window=20, min_periods=1).mean().replace(0, np.nan)
+
+    raw_breakout = _safe_divide(
         features["close"] - rolling_high, rolling_high
     )
+    # Required update: breakout strength scaled by (volume / volume_ma_20)
+    vol_ratio = (features["volume"] / volume_ma_20).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    features["breakout_strength"] = raw_breakout * vol_ratio
 
     prev_high = rolling_high.shift(1)
     features["breakout_failure"] = (
@@ -78,6 +83,11 @@ def compute_trap_features(
     features["upper_wick_ratio"] = _safe_divide(
         features["high"] - features["close"], candle_range
     )
+    features["lower_wick_ratio"] = _safe_divide(
+        features["close"] - features["low"], candle_range
+    )
+    # 3-bar rolling mean — a *sequence* of large wicks is more significant
+    features["mean_wick_ratio_3"] = features["upper_wick_ratio"].rolling(3, min_periods=1).mean()
 
     features["body_to_range_ratio"] = _safe_divide(
         (features["close"] - features["open"]).abs(), candle_range
@@ -85,16 +95,40 @@ def compute_trap_features(
 
     volume_mean = features["volume"].rolling(window=volume_window, min_periods=1).mean()
     features["volume_spike"] = (features["volume"] > volume_mean * 1.5).astype(int)
-    features["absorption_signal"] = (
+
+    # Absorption at S/R level — only flag absorption near highs or lows
+    near_high = features["close"] >= rolling_high * 0.995
+    near_low = features["close"] <= rolling_low * 1.005
+    raw_absorption = (
         (features["volume_spike"] == 1) & (features["body_to_range_ratio"] < 0.3)
+    )
+    features["absorption_signal"] = raw_absorption.astype(int)
+    features["absorption_at_level"] = (
+        raw_absorption & (near_high | near_low)
     ).astype(int)
 
-    features["volume_divergence"] = (
-        (features["price_return"] > 0) & (features["volume_change"] < 0)
-    ).astype(int)
+    # Required update: continuous volume divergence score.
+    # Positive when price rises while volume change weakens.
+    pos_return = features["price_return"].clip(lower=0)
+    neg_vol_change = (-features["volume_change"]).clip(lower=0)
+    max_abs = (
+        features["volume_change"]
+        .abs()
+        .rolling(window=volume_window, min_periods=1)
+        .max()
+        .replace(0, 1)
+    )
+    features["volume_divergence"] = (pos_return * (neg_vol_change / max_abs)).clip(0, 1)
 
+    # Fast and slow PV correlation — divergence between them signals regime shift
     features["pv_correlation"] = (
         features["price_return"].rolling(window=corr_window).corr(features["volume_change"])
+    )
+    features["pv_correlation_fast"] = (
+        features["price_return"].rolling(window=5).corr(features["volume_change"])
+    )
+    features["pv_correlation_slow"] = (
+        features["price_return"].rolling(window=20).corr(features["volume_change"])
     )
 
     features["volume_spike_on_reversal"] = (
@@ -114,9 +148,13 @@ def compute_trap_features(
         (features["rsi_14"] > 70) & (features["rsi_14"].diff() < 0)
     ).astype(int)
 
+    # Adaptive fast_reversal: threshold scales with rolling volatility
+    # In low-vol environments 1% is significant; in high-vol 3% may be noise
+    volatility_20 = features["price_return"].rolling(window=20, min_periods=5).std().fillna(0.01)
+    reversal_threshold = (2.5 * volatility_20).clip(lower=0.005, upper=0.05)
     features["fast_reversal"] = (
-        (features["price_return"].shift(1) > 0.02)
-        & (features["price_return"] < -0.02)
+        (features["price_return"].shift(1) > reversal_threshold)
+        & (features["price_return"] < -reversal_threshold)
     ).astype(int)
 
     features["momentum_fade"] = (

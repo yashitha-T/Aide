@@ -8,6 +8,7 @@ joblib>=1.1.0
 pyspark>=3.2.0
 mplfinance>=0.12.7b0
 streamlit>=1.10.0
+streamlit-autorefresh>=1.0.1
 plotly>=5.5.0
 requests>=2.25.0
 websocket-client>=1.0.0
